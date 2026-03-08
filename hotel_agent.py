@@ -379,7 +379,7 @@ async def entrypoint(ctx: JobContext):
     logger.info("[Agent] Session started, generating greeting...")
     
     await session.generate_reply(
-        instructions="Przywitaj sie DOKLADNIE tymi slowami: Witamy w Goralskim Wzgorzu. Pokoje i apartamenty w Zakopanem. W czym moge pomoc?"
+        instructions="Przywitaj sie DOKLADNIE tymi slowami: Witamy. Jestem Anna W czym moge pomoc?"
     )
 
 
@@ -387,6 +387,6 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="ririka-hotel-agent",
+            agent_name="lka",
         )
     )
