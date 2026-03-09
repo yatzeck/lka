@@ -1,398 +1,343 @@
 import os
+import re
 import logging
-from datetime import date
 from typing import Any, Optional
 
-import httpx
+from dotenv import load_dotenv
 
-logger = logging.getLogger("wp-front-ajax-client")
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    RunContext,
+    WorkerOptions,
+    cli,
+)
+from livekit.agents.llm import function_tool
+from livekit.plugins import openai, silero
+
+from wp_front_ajax_client import FrontAjaxClient
+
+load_dotenv(".env.local")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("medical-agent-sip")
+
+CLINIC_NAME = os.environ.get("CLINIC_NAME", "Prywatna Praktyka Ortopedyczna Doktora Adama Kowalskiego")
+DOCTOR_ID = os.environ.get("DEMO_DOCTOR_ID", "")
+REALTIME_VOICE = os.environ.get("REALTIME_VOICE", "shimmer")
+AGENT_NAME = os.environ.get("AGENT_NAME", "lka")
+FRONT_AJAX_URL = os.environ.get("FRONT_AJAX_URL", "")
+FRONT_AJAX_API_KEY_SET = bool(os.environ.get("FRONT_AJAX_API_KEY") or os.environ.get("SMS_API_KEY"))
+
+print("=== LKA KOWALSKI DEMO BUILD v1 ===")
 
 
-class FrontAjaxClient:
-    """Thin async client for WordPress front_ajax.php used by the demo agent.
+def get_caller_phone_from_room_name(room_name: str) -> Optional[str]:
+    if not room_name:
+        return None
+    match = re.search(r"\+?\d{6,}", room_name)
+    return match.group(0) if match else None
 
-    Notes:
-    - Uses JSON actions when front_ajax.php registers them in the top action map.
-    - Uses multipart/form POST for legacy actions like WolneTerminy / TerminZapisz / AppointmentCancel.
-    - A few JSON actions (PatientVisits / AppointmentGet / AppointmentReschedule) are inferred from
-      front_ajax.php routing but their exact backend contract isn't visible in uploaded files.
-      The client therefore tries a conservative payload and returns backend output verbatim.
-    """
 
+class KowalskiDemoAgent(Agent):
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        timeout_s: float = 30.0,
-    ) -> None:
-        self.base_url = (base_url or os.environ.get("FRONT_AJAX_URL") or "").rstrip("/")
-        self.api_key = api_key or os.environ.get("FRONT_AJAX_API_KEY") or os.environ.get("SMS_API_KEY") or ""
-        self.timeout_s = timeout_s
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.base_url and self.api_key)
-
-    def _headers(self, json_mode: bool = True) -> dict[str, str]:
-        headers = {"X-API-KEY": self.api_key}
-        if json_mode:
-            headers["Content-Type"] = "application/json"
-        return headers
-
-    async def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.enabled:
-            return {"ok": False, "error": "FRONT_AJAX_URL or FRONT_AJAX_API_KEY missing"}
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(self.base_url, json=payload, headers=self._headers(json_mode=True))
-                text = response.text
-                response.raise_for_status()
-                try:
-                    data = response.json()
-                except Exception:
-                    data = {"raw": text}
-                return {"ok": True, "data": data, "status_code": response.status_code}
-        except httpx.HTTPStatusError as e:
-            return {
-                "ok": False,
-                "error": f"HTTP {e.response.status_code}",
-                "details": e.response.text[:2000],
-            }
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    async def _post_form(self, form: dict[str, Any]) -> dict[str, Any]:
-        if not self.enabled:
-            return {"ok": False, "error": "FRONT_AJAX_URL or FRONT_AJAX_API_KEY missing"}
-        safe_form = {k: "" if v is None else str(v) for k, v in form.items()}
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                response = await client.post(self.base_url, data=safe_form, headers={"X-API-KEY": self.api_key})
-                text = response.text
-                response.raise_for_status()
-                try:
-                    data = response.json()
-                except Exception:
-                    data = {"raw": text}
-                return {"ok": True, "data": data, "status_code": response.status_code}
-        except httpx.HTTPStatusError as e:
-            return {
-                "ok": False,
-                "error": f"HTTP {e.response.status_code}",
-                "details": e.response.text[:2000],
-            }
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    @staticmethod
-    def normalize_phone(phone: Optional[str]) -> str:
-        if not phone:
-            return ""
-        digits = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
-        digits = digits.replace(" ", "").replace("-", "")
-        if digits.startswith("0048"):
-            digits = "+48" + digits[4:]
-        elif digits.startswith("48") and len(digits) == 11:
-            digits = "+" + digits
-        elif digits.startswith("+"):
-            pass
-        elif len(digits) == 9:
-            digits = "+48" + digits
-        return digits
-
-    @staticmethod
-    def _today_str() -> str:
-        return date.today().isoformat()
-
-    async def doctor_get(self, doctor_id: str) -> dict[str, Any]:
-        return await self._post_json({
-            "action": "Doctors",
-            "doctor_id": doctor_id,
-        })
-
-    async def patient_get(
-        self,
-        *,
-        phone: Optional[str] = None,
-        first_name: str = "",
-        last_name: str = "",
-        email: str = "",
-        pesel: str = "",
-    ) -> dict[str, Any]:
-        payload = {"action": "PatientGet"}
-        normalized_phone = self.normalize_phone(phone)
-        if normalized_phone:
-            payload["telefon"] = normalized_phone
-            payload["kontakt"] = normalized_phone
-        if first_name:
-            payload["imie"] = first_name
-        if last_name:
-            payload["nazwisko"] = last_name
-        if email:
-            payload["email"] = email
-        if pesel:
-            payload["pesel"] = pesel
-        return await self._post_json(payload)
-
-    async def patient_add(
-        self,
-        *,
-        first_name: str,
-        last_name: str,
-        phone: Optional[str],
-        email: str = "",
-    ) -> dict[str, Any]:
-        normalized_phone = self.normalize_phone(phone)
-        payload = {
-            "action": "PatientAdd",
-            "imie": first_name,
-            "nazwisko": last_name,
-            "telefon": normalized_phone,
-            "kontakt": normalized_phone,
-            "email": email,
-            "gdzie": "bot",
-        }
-        return await self._post_json(payload)
-
-    async def patient_resolve_or_create(
-        self,
-        *,
         caller_phone: Optional[str],
-        first_name: str = "",
-        last_name: str = "",
-        email: str = "",
-    ) -> dict[str, Any]:
-        # 1. try exact phone match first - this is supported by psga_PacjentGet in uploaded plugin code
-        if caller_phone:
-            existing = await self.patient_get(phone=caller_phone)
-            if existing.get("ok") and existing.get("data"):
-                return existing
+        client: FrontAjaxClient,
+        recognized_patient: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.caller_phone = caller_phone
+        self.client = client
+        self.recognized_patient = recognized_patient or {}
+        self.last_presented_slots: list[dict[str, Any]] = []
 
-        # 2. try by name+phone when both exist
-        if caller_phone and first_name and last_name:
-            existing = await self.patient_get(
-                phone=caller_phone,
-                first_name=first_name,
-                last_name=last_name,
-                email=email,
+        patient_line = "Nie rozpoznano pacjenta po numerze telefonu."
+        if self.recognized_patient.get("pcj_id"):
+            patient_line = (
+                f"Rozpoznany pacjent po numerze telefonu: "
+                f"{self.recognized_patient.get('first_name', '')} {self.recognized_patient.get('last_name', '')}, "
+                f"pcj_id={self.recognized_patient.get('pcj_id', '')}, telefon={self.recognized_patient.get('phone', '')}."
             )
-            if existing.get("ok") and existing.get("data"):
-                return existing
 
-        # 3. create only if enough data available
-        if first_name and last_name and caller_phone:
-            created = await self.patient_add(
-                first_name=first_name,
-                last_name=last_name,
-                phone=caller_phone,
-                email=email,
+        super().__init__(
+            instructions=f"""
+# Rola i cel
+Jestes medycznym asystentem glosowym dla placowki {CLINIC_NAME}. Obslugujesz jedna praktyke doktora Adama Kowalskiego.
+
+# Najwazniejsze zasady
+- Mow po polsku, krotko, naturalnie i spokojnie.
+- Jedna mysl na raz.
+- Nie zostawiaj rozmowcy w ciszy. Gdy wywolujesz narzedzie, powiedz najpierw krotko: "Juz sprawdzam..." albo "Chwileczke...".
+- Nie wymyslaj terminow, nazw uslug, identyfikatorow ani statusow. Korzystaj tylko z danych z narzedzi.
+- Gdy masz kilka terminow, podaj maksymalnie 3 naraz.
+- Nie pytaj ponownie o rzeczy, ktore juz zostaly ustalone w rozmowie.
+- Nie pytaj o numer telefonu, jesli mamy numer z polaczenia i pacjent go potwierdza.
+- Jesli pacjent jest rozpoznany po numerze telefonu, nie pytaj o imie i nazwisko do zwyklego odwolania lub przelozenia, chyba ze pojawi sie niejednoznacznosc.
+- Przed umowieniem wizyty musisz potwierdzic: termin, imie i nazwisko pacjenta oraz numer telefonu.
+- Przed odwolaniem lub przeniesieniem musisz potwierdzic, ktora konkretna wizyte pacjent ma na mysli.
+
+# Kontekst
+Numer z polaczenia: {caller_phone or 'nieznany'}
+{patient_line}
+Doktor: Adam Kowalski
+Specjalizacja: ortopedia
+
+# Dozwolone sprawy
+- sprawdzenie terminow
+- umowienie wizyty
+- odwolanie wizyty
+- przeniesienie wizyty
+
+# Gdy pacjent pyta o terminy
+1. Ustal brakujace informacje, zwlaszcza od kiedy szukac.
+2. Wywolaj narzedzie sprawdz_terminy.
+3. Podaj 2-3 najblizsze pasujace opcje glosowo.
+
+# Gdy pacjent chce umowic wizyte
+1. Ustal termin.
+2. Jesli pacjent jest rozpoznany po numerze telefonu, wykorzystaj te dane.
+3. Jesli nie jest rozpoznany, zbierz tylko imie i nazwisko; numer telefonu wez z polaczenia, chyba ze pacjent chce inny.
+4. Potwierdz dane.
+5. Wywolaj umow_termin.
+
+# Gdy pacjent chce odwolac lub przeniesc wizyte
+1. Jesli pacjent jest rozpoznany po numerze telefonu, najpierw sprobuj znalezc jego wizyte narzedziem.
+2. Potwierdz konkretna wizyte.
+3. Dopiero potem odwolaj lub przenies.
+
+# Powitanie
+Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
+""",
+        )
+
+    @function_tool()
+    async def sprawdz_terminy(
+        self,
+        context: RunContext,
+        data_od: str,
+        data_do: str = "",
+        pora_dnia: str = "",
+    ) -> dict[str, Any]:
+        """Sprawdza wolne terminy doktora Adama Kowalskiego.
+
+        Args:
+            data_od: Data poczatkowa wyszukiwania w formacie YYYY-MM-DD.
+            data_do: Opcjonalna data koncowa w formacie YYYY-MM-DD.
+            pora_dnia: Opcjonalnie rano, popoludnie albo wieczor.
+        """
+        logger.info("[Tool] sprawdz_terminy %s %s %s", data_od, data_do, pora_dnia)
+        if not DOCTOR_ID:
+            return {"ok": False, "error": "DEMO_DOCTOR_ID missing"}
+        raw = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=data_od)
+        if not raw.get("ok"):
+            return raw
+        slots = self.client.compact_slots(raw.get("data"), date_to=data_do, time_of_day=pora_dnia)
+        self.last_presented_slots = slots[:10]
+        return {
+            "ok": True,
+            "doctor_id": DOCTOR_ID,
+            "slots": slots[:3],
+            "slots_total": len(slots),
+        }
+
+    @function_tool()
+    async def umow_termin(
+        self,
+        context: RunContext,
+        data_wizyty: str,
+        godzina_od: str,
+        imie: str = "",
+        nazwisko: str = "",
+        telefon: str = "",
+    ) -> dict[str, Any]:
+        """Umawia wizyte u doktora Adama Kowalskiego.
+
+        Args:
+            data_wizyty: Data wizyty w formacie YYYY-MM-DD.
+            godzina_od: Godzina rozpoczecia w formacie HH:MM.
+            imie: Imie pacjenta. Mozna pominac, jesli pacjent zostal rozpoznany po numerze.
+            nazwisko: Nazwisko pacjenta. Mozna pominac, jesli pacjent zostal rozpoznany po numerze.
+            telefon: Numer telefonu pacjenta. Opcjonalny, domyslnie numer z polaczenia.
+        """
+        logger.info("[Tool] umow_termin %s %s", data_wizyty, godzina_od)
+        phone_to_use = telefon or self.caller_phone or self.recognized_patient.get("phone", "")
+        patient = self.recognized_patient if self.recognized_patient.get("pcj_id") else None
+
+        if not patient:
+            resolved = await self.client.patient_resolve_or_create(
+                caller_phone=phone_to_use,
+                first_name=imie,
+                last_name=nazwisko,
             )
-            return created
+            if not resolved.get("ok"):
+                return {
+                    "ok": False,
+                    "error": "patient_not_resolved",
+                    "details": resolved,
+                }
+            patient = self.client.compact_patient(resolved.get("data"))
+            self.recognized_patient = patient
 
+        slots_source = self.last_presented_slots
+        if not slots_source:
+            raw_slots = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=data_wizyty)
+            if not raw_slots.get("ok"):
+                return raw_slots
+            slots_source = self.client.compact_slots(raw_slots.get("data"), date_to=data_wizyty)
+
+        slot = self.client.choose_slot(slots_source, appointment_date=data_wizyty, appointment_time=godzina_od)
+        if not slot:
+            return {"ok": False, "error": "slot_not_found"}
+
+        booked = await self.client.appointment_book(
+            doctor_id=DOCTOR_ID,
+            start_dt=slot["start"],
+            end_dt=slot["end"],
+            patient_id=patient.get("pcj_id", ""),
+        )
         return {
-            "ok": False,
-            "error": "patient_not_resolved",
-            "details": "Need at least caller phone or full patient data",
+            "ok": booked.get("ok", False),
+            "booking_result": booked,
+            "patient": patient,
+            "slot": slot,
         }
 
-    async def free_terms(self, *, doctor_id: str, date_from: str) -> dict[str, Any]:
-        return await self._post_form({
-            "action": "WolneTerminy",
-            "lekarz_id": doctor_id,
-            "data_od": date_from,
-        })
-
-    async def appointment_book(
+    @function_tool()
+    async def odwolaj_termin(
         self,
-        *,
-        doctor_id: str,
-        start_dt: str,
-        end_dt: str,
-        patient_id: str,
-        rodzaj: str = "wizyta",
-    ) -> dict[str, Any]:
-        return await self._post_form({
-            "action": "TerminZapisz",
-            "lekarz_id": doctor_id,
-            "start": start_dt,
-            "end": end_dt,
-            "pcj_id": patient_id,
-            "rodzaj": rodzaj,
-        })
-
-    async def appointment_cancel(self, *, pw_id: str) -> dict[str, Any]:
-        return await self._post_form({
-            "action": "AppointmentCancel",
-            "pw_id": pw_id,
-        })
-
-    async def patient_visits(
-        self,
-        *,
-        patient_id: Optional[str] = None,
-        phone: Optional[str] = None,
-        doctor_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        # Contract inferred from front_ajax action map. Backend may ignore unknown fields.
-        payload: dict[str, Any] = {"action": "PatientVisits"}
-        if patient_id:
-            payload["pcj_id"] = patient_id
-        if phone:
-            normalized_phone = self.normalize_phone(phone)
-            payload["telefon"] = normalized_phone
-            payload["kontakt"] = normalized_phone
-        if doctor_id:
-            payload["doctor_id"] = doctor_id
-            payload["lekarz_id"] = doctor_id
-        payload["future_only"] = 1
-        payload["date_from"] = self._today_str()
-        return await self._post_json(payload)
-
-    async def appointment_get(
-        self,
-        *,
-        patient_id: Optional[str] = None,
-        phone: Optional[str] = None,
-        doctor_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        # Contract inferred from front_ajax action map.
-        payload: dict[str, Any] = {"action": "AppointmentGet"}
-        if patient_id:
-            payload["pcj_id"] = patient_id
-        if phone:
-            normalized_phone = self.normalize_phone(phone)
-            payload["telefon"] = normalized_phone
-            payload["kontakt"] = normalized_phone
-        if doctor_id:
-            payload["doctor_id"] = doctor_id
-            payload["lekarz_id"] = doctor_id
-        payload["future_only"] = 1
-        payload["date_from"] = self._today_str()
-        return await self._post_json(payload)
-
-    async def appointment_lookup(
-        self,
-        *,
-        patient_id: Optional[str] = None,
-        phone: Optional[str] = None,
-        doctor_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        first = await self.patient_visits(patient_id=patient_id, phone=phone, doctor_id=doctor_id)
-        if first.get("ok") and first.get("data"):
-            return first
-        second = await self.appointment_get(patient_id=patient_id, phone=phone, doctor_id=doctor_id)
-        return second
-
-    async def appointment_reschedule(
-        self,
-        *,
-        pw_id: str,
-        new_start: str,
-        new_end: str,
-        doctor_id: Optional[str] = None,
-    ) -> dict[str, Any]:
-        # Contract inferred from front_ajax action map.
-        payload: dict[str, Any] = {
-            "action": "AppointmentReschedule",
-            "pw_id": pw_id,
-            "new_start": new_start,
-            "new_end": new_end,
-        }
-        if doctor_id:
-            payload["doctor_id"] = doctor_id
-            payload["lekarz_id"] = doctor_id
-        return await self._post_json(payload)
-
-    @staticmethod
-    def compact_patient(data: Any) -> dict[str, Any]:
-        if isinstance(data, list):
-            row = data[0] if data else {}
-        elif isinstance(data, dict):
-            row = data
-        else:
-            row = {}
-        return {
-            "pcj_id": str(row.get("pcj_id", "")),
-            "first_name": row.get("pcj_imie") or row.get("imie") or "",
-            "last_name": row.get("pcj_nazwisko") or row.get("nazwisko") or "",
-            "phone": row.get("telefon") or row.get("pcj_kontakt") or row.get("kontakt") or "",
-            "email": row.get("pcj_email") or row.get("email") or "",
-        }
-
-    @staticmethod
-    def compact_slots(data: Any, *, date_to: str = "", time_of_day: str = "") -> list[dict[str, Any]]:
-        rows = data if isinstance(data, list) else []
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            slot_date = str(row.get("data", ""))
-            godz_od = str(row.get("godz_od", ""))
-            godz_do = str(row.get("godz_do", ""))
-            if date_to and slot_date and slot_date > date_to:
-                continue
-            if time_of_day:
-                hh = int(godz_od[:2]) if godz_od and godz_od[:2].isdigit() else -1
-                if time_of_day == "rano" and not (0 <= hh < 12):
-                    continue
-                if time_of_day == "popoludnie" and not (12 <= hh < 17):
-                    continue
-                if time_of_day == "wieczor" and not (17 <= hh <= 21):
-                    continue
-            if slot_date and godz_od and godz_do:
-                out.append({
-                    "slot_id": f"{slot_date}T{godz_od}",
-                    "date": slot_date,
-                    "start_time": godz_od,
-                    "end_time": godz_do,
-                    "start": f"{slot_date} {godz_od}:00",
-                    "end": f"{slot_date} {godz_do}:00",
-                    "day_name": row.get("dzien", ""),
-                    "duration": row.get("czas", ""),
-                })
-        return out
-
-    @staticmethod
-    def choose_slot(
-        slots: list[dict[str, Any]],
-        *,
-        slot_id: str = "",
-        appointment_date: str = "",
-        appointment_time: str = "",
-    ) -> Optional[dict[str, Any]]:
-        if slot_id:
-            for slot in slots:
-                if slot.get("slot_id") == slot_id:
-                    return slot
-        if appointment_date and appointment_time:
-            for slot in slots:
-                if slot.get("date") == appointment_date and slot.get("start_time") == appointment_time:
-                    return slot
-        if appointment_date:
-            for slot in slots:
-                if slot.get("date") == appointment_date:
-                    return slot
-        return slots[0] if slots else None
-
-    @staticmethod
-    def choose_visit(
-        visits_data: Any,
-        *,
+        context: RunContext,
+        data_wizyty: str = "",
         pw_id: str = "",
-        appointment_date: str = "",
-    ) -> Optional[dict[str, Any]]:
-        rows = visits_data if isinstance(visits_data, list) else []
-        if isinstance(visits_data, dict):
-            # some APIs wrap list under data/items/visits
-            for key in ("items", "visits", "appointments", "data"):
-                if isinstance(visits_data.get(key), list):
-                    rows = visits_data[key]
-                    break
-        if pw_id:
-            for row in rows:
-                if str(row.get("pw_id", "")) == str(pw_id):
-                    return row
-        if appointment_date:
-            for row in rows:
-                start = str(row.get("pw_start") or row.get("start") or row.get("date") or "")
-                if start.startswith(appointment_date):
-                    return row
-        return rows[0] if rows else None
+    ) -> dict[str, Any]:
+        """Odwoluje istniejaca wizyte pacjenta.
+
+        Args:
+            data_wizyty: Opcjonalna data wizyty do anulowania w formacie YYYY-MM-DD.
+            pw_id: Opcjonalny identyfikator wizyty, jesli jest juz znany.
+        """
+        logger.info("[Tool] odwolaj_termin %s %s", data_wizyty, pw_id)
+        patient_id = self.recognized_patient.get("pcj_id", "")
+        lookup = await self.client.appointment_lookup(
+            patient_id=patient_id or None,
+            phone=self.caller_phone,
+            doctor_id=DOCTOR_ID,
+        )
+        if not lookup.get("ok"):
+            return lookup
+        visit = self.client.choose_visit(lookup.get("data"), pw_id=pw_id, appointment_date=data_wizyty)
+        if not visit:
+            return {"ok": False, "error": "appointment_not_found", "lookup": lookup}
+        cancel = await self.client.appointment_cancel(pw_id=str(visit.get("pw_id", "")))
+        return {
+            "ok": cancel.get("ok", False),
+            "cancel_result": cancel,
+            "visit": visit,
+        }
+
+    @function_tool()
+    async def przenies_termin(
+        self,
+        context: RunContext,
+        stara_data_wizyty: str,
+        nowa_data_wizyty: str,
+        nowa_godzina_od: str,
+        pw_id: str = "",
+    ) -> dict[str, Any]:
+        """Przenosi wizyte pacjenta na inny termin.
+
+        Args:
+            stara_data_wizyty: Data obecnej wizyty w formacie YYYY-MM-DD.
+            nowa_data_wizyty: Nowa data wizyty w formacie YYYY-MM-DD.
+            nowa_godzina_od: Nowa godzina rozpoczecia w formacie HH:MM.
+            pw_id: Opcjonalny identyfikator wizyty.
+        """
+        logger.info("[Tool] przenies_termin %s -> %s %s", stara_data_wizyty, nowa_data_wizyty, nowa_godzina_od)
+        patient_id = self.recognized_patient.get("pcj_id", "")
+        lookup = await self.client.appointment_lookup(
+            patient_id=patient_id or None,
+            phone=self.caller_phone,
+            doctor_id=DOCTOR_ID,
+        )
+        if not lookup.get("ok"):
+            return lookup
+        visit = self.client.choose_visit(lookup.get("data"), pw_id=pw_id, appointment_date=stara_data_wizyty)
+        if not visit:
+            return {"ok": False, "error": "appointment_not_found", "lookup": lookup}
+
+        raw_slots = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=nowa_data_wizyty)
+        if not raw_slots.get("ok"):
+            return raw_slots
+        slots = self.client.compact_slots(raw_slots.get("data"), date_to=nowa_data_wizyty)
+        slot = self.client.choose_slot(slots, appointment_date=nowa_data_wizyty, appointment_time=nowa_godzina_od)
+        if not slot:
+            return {"ok": False, "error": "new_slot_not_found", "slots": slots[:5]}
+
+        moved = await self.client.appointment_reschedule(
+            pw_id=str(visit.get("pw_id", "")),
+            new_start=slot["start"],
+            new_end=slot["end"],
+            doctor_id=DOCTOR_ID,
+        )
+        return {
+            "ok": moved.get("ok", False),
+            "reschedule_result": moved,
+            "old_visit": visit,
+            "new_slot": slot,
+        }
+
+
+async def entrypoint(ctx: JobContext):
+    logger.info("=" * 50)
+    logger.info("[Agent] New SIP call! Room: %s", ctx.room.name)
+    logger.info("[Agent] FRONT_AJAX_URL: %s", FRONT_AJAX_URL)
+    logger.info("[Agent] FRONT_AJAX_API_KEY set: %s", FRONT_AJAX_API_KEY_SET)
+    logger.info("[Agent] DEMO_DOCTOR_ID: %s", DOCTOR_ID)
+    logger.info("=" * 50)
+
+    caller_phone = get_caller_phone_from_room_name(ctx.room.name)
+    logger.info("[Agent] Caller phone (from room name): %s", caller_phone)
+
+    client = FrontAjaxClient()
+    recognized_patient: dict[str, Any] = {}
+    if caller_phone:
+        resolved = await client.patient_get(phone=caller_phone)
+        if resolved.get("ok") and resolved.get("data"):
+            recognized_patient = client.compact_patient(resolved.get("data"))
+            logger.info("[Agent] Recognized patient: %s", recognized_patient)
+        else:
+            logger.info("[Agent] Patient not recognized by caller phone")
+
+    agent = KowalskiDemoAgent(
+        caller_phone=caller_phone,
+        client=client,
+        recognized_patient=recognized_patient,
+    )
+
+    # Mechanika komunikacyjna zostawiona jak w dzialajacym pliku.
+    session = AgentSession(
+        llm=openai.realtime.RealtimeModel(voice=REALTIME_VOICE),
+        vad=silero.VAD.load(),
+    )
+
+    await session.start(
+        agent=agent,
+        room=ctx.room,
+    )
+
+    await ctx.connect()
+
+    logger.info("[Agent] Session started, generating greeting...")
+
+    await session.generate_reply(
+        instructions="Przywitaj sie dokladnie tymi slowami: Dzien dobry, tu medyczny asystent glosowy. W czym moge pomoc?"
+    )
+
+
+if __name__ == "__main__":
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name=AGENT_NAME,
+        )
+    )
