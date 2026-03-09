@@ -1,136 +1,398 @@
 import os
-import re
 import logging
-from typing import Optional
+from datetime import date
+from typing import Any, Optional
 
-from dotenv import load_dotenv
+import httpx
 
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
-)
-from livekit.plugins import openai, silero
-
-load_dotenv(".env.local")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("medical-agent-sip")
-
-print("=== LKA MEDICAL CLEAN BUILD ===")
-
-CLINIC_NAME = os.environ.get("CLINIC_NAME", "Prywatna placówka medyczna")
-REALTIME_VOICE = os.environ.get("REALTIME_VOICE", "shimmer")
+logger = logging.getLogger("wp-front-ajax-client")
 
 
-class MedicalAssistantSIP(Agent):
-    def __init__(self, caller_phone: Optional[str] = None) -> None:
-        self.caller_phone = caller_phone
-        logger.info(f"[Agent] Initialized with caller_phone: {caller_phone}")
+class FrontAjaxClient:
+    """Thin async client for WordPress front_ajax.php used by the demo agent.
 
-        super().__init__(
-            instructions=f"""
-# Rola i cel
-Jestes medycznym asystentem glosowym dla placowki {CLINIC_NAME}. Odbierasz polaczenia telefoniczne i prowadzisz krotka, naturalna rozmowe z pacjentem.
+    Notes:
+    - Uses JSON actions when front_ajax.php registers them in the top action map.
+    - Uses multipart/form POST for legacy actions like WolneTerminy / TerminZapisz / AppointmentCancel.
+    - A few JSON actions (PatientVisits / AppointmentGet / AppointmentReschedule) are inferred from
+      front_ajax.php routing but their exact backend contract isn't visible in uploaded files.
+      The client therefore tries a conservative payload and returns backend output verbatim.
+    """
 
-# Osobowosc i ton
-## Osobowosc
-Spokojna, ciepla, empatyczna i profesjonalna. Sluchasz uwaznie i odpowiadasz rzeczowo.
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        self.base_url = (base_url or os.environ.get("FRONT_AJAX_URL") or "").rstrip("/")
+        self.api_key = api_key or os.environ.get("FRONT_AJAX_API_KEY") or os.environ.get("SMS_API_KEY") or ""
+        self.timeout_s = timeout_s
 
-## Ton
-Cieplo-serdeczny, opanowany, pewny siebie. Nigdy nie brzmisz sztucznie ani przesadnie formalnie.
+    @property
+    def enabled(self) -> bool:
+        return bool(self.base_url and self.api_key)
 
-## Dlugosc wypowiedzi
-Maksymalnie 2-3 zdania na raz. Mow zwiezle.
+    def _headers(self, json_mode: bool = True) -> dict[str, str]:
+        headers = {"X-API-KEY": self.api_key}
+        if json_mode:
+            headers["Content-Type"] = "application/json"
+        return headers
 
-## Tempo
-Mow spokojnie i wyraznie, bez pospieszania.
+    async def _post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "FRONT_AJAX_URL or FRONT_AJAX_API_KEY missing"}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                response = await client.post(self.base_url, json=payload, headers=self._headers(json_mode=True))
+                text = response.text
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"raw": text}
+                return {"ok": True, "data": data, "status_code": response.status_code}
+        except httpx.HTTPStatusError as e:
+            return {
+                "ok": False,
+                "error": f"HTTP {e.response.status_code}",
+                "details": e.response.text[:2000],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
-## Jezyk
-Tylko polski. Nie uzywaj emoji, gwiazdek ani formatowania.
+    async def _post_form(self, form: dict[str, Any]) -> dict[str, Any]:
+        if not self.enabled:
+            return {"ok": False, "error": "FRONT_AJAX_URL or FRONT_AJAX_API_KEY missing"}
+        safe_form = {k: "" if v is None else str(v) for k, v in form.items()}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+                response = await client.post(self.base_url, data=safe_form, headers={"X-API-KEY": self.api_key})
+                text = response.text
+                response.raise_for_status()
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"raw": text}
+                return {"ok": True, "data": data, "status_code": response.status_code}
+        except httpx.HTTPStatusError as e:
+            return {
+                "ok": False,
+                "error": f"HTTP {e.response.status_code}",
+                "details": e.response.text[:2000],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
-# NAJWAZNIEJSZA ZASADA - ZERO CISZY
-Nigdy nie zostawiaj rozmowcy w ciszy. Jesli potrzebujesz chwili, powiedz krotko:
-- "Juz slucham..."
-- "Chwileczke..."
-- "Prosze powiedziec jeszcze raz..."
-- "Juz sprawdzam..."
+    @staticmethod
+    def normalize_phone(phone: Optional[str]) -> str:
+        if not phone:
+            return ""
+        digits = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
+        digits = digits.replace(" ", "").replace("-", "")
+        if digits.startswith("0048"):
+            digits = "+48" + digits[4:]
+        elif digits.startswith("48") and len(digits) == 11:
+            digits = "+" + digits
+        elif digits.startswith("+"):
+            pass
+        elif len(digits) == 9:
+            digits = "+48" + digits
+        return digits
 
-# Kontekst polaczenia
-Numer telefonu dzwoniacego: {caller_phone or 'nieznany'}
+    @staticmethod
+    def _today_str() -> str:
+        return date.today().isoformat()
 
-# Zasady rozmowy
-- Na tym etapie nie uzywasz zadnych narzedzi.
-- Nie wymyslasz terminow wizyt.
-- Nie potwierdzasz rezerwacji ani zapisow.
-- Nie obiecujesz oddzwonienia.
-- Nie wspominasz o hotelu, pokojach, noclegach, apartamentach ani rezerwacjach hotelowych.
-- Gdy pacjent chce umowic wizyte, powiedz uprzejmie, ze to testowy asystent i popros o krotkie opisanie potrzeby.
-- Gdy pacjent pyta o terminy, odpowiedz, ze na razie nie masz dostepu do terminarza.
-- Gdy czegos nie rozumiesz, popros o powtorzenie.
-- Jedna mysl na raz.
-- Nie wygłaszaj dlugich monologow.
+    async def doctor_get(self, doctor_id: str) -> dict[str, Any]:
+        return await self._post_json({
+            "action": "Doctors",
+            "doctor_id": doctor_id,
+        })
 
-# Powitanie
-Na poczatku przywitaj rozmowce i zapytaj, w czym mozesz pomoc.
+    async def patient_get(
+        self,
+        *,
+        phone: Optional[str] = None,
+        first_name: str = "",
+        last_name: str = "",
+        email: str = "",
+        pesel: str = "",
+    ) -> dict[str, Any]:
+        payload = {"action": "PatientGet"}
+        normalized_phone = self.normalize_phone(phone)
+        if normalized_phone:
+            payload["telefon"] = normalized_phone
+            payload["kontakt"] = normalized_phone
+        if first_name:
+            payload["imie"] = first_name
+        if last_name:
+            payload["nazwisko"] = last_name
+        if email:
+            payload["email"] = email
+        if pesel:
+            payload["pesel"] = pesel
+        return await self._post_json(payload)
 
-# Zakonczenie rozmowy
-Gdy rozmowca konczy rozmowe, odpowiedz krotko i naturalnie, na przyklad:
-"Dziekuje za rozmowe. Do widzenia."
-"""
-        )
+    async def patient_add(
+        self,
+        *,
+        first_name: str,
+        last_name: str,
+        phone: Optional[str],
+        email: str = "",
+    ) -> dict[str, Any]:
+        normalized_phone = self.normalize_phone(phone)
+        payload = {
+            "action": "PatientAdd",
+            "imie": first_name,
+            "nazwisko": last_name,
+            "telefon": normalized_phone,
+            "kontakt": normalized_phone,
+            "email": email,
+            "gdzie": "bot",
+        }
+        return await self._post_json(payload)
 
+    async def patient_resolve_or_create(
+        self,
+        *,
+        caller_phone: Optional[str],
+        first_name: str = "",
+        last_name: str = "",
+        email: str = "",
+    ) -> dict[str, Any]:
+        # 1. try exact phone match first - this is supported by psga_PacjentGet in uploaded plugin code
+        if caller_phone:
+            existing = await self.patient_get(phone=caller_phone)
+            if existing.get("ok") and existing.get("data"):
+                return existing
 
-def get_caller_phone_from_room_name(room_name: str) -> Optional[str]:
-    if not room_name:
-        return None
-    match = re.search(r"\+?\d{6,}", room_name)
-    return match.group(0) if match else None
+        # 2. try by name+phone when both exist
+        if caller_phone and first_name and last_name:
+            existing = await self.patient_get(
+                phone=caller_phone,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+            )
+            if existing.get("ok") and existing.get("data"):
+                return existing
 
+        # 3. create only if enough data available
+        if first_name and last_name and caller_phone:
+            created = await self.patient_add(
+                first_name=first_name,
+                last_name=last_name,
+                phone=caller_phone,
+                email=email,
+            )
+            return created
 
-async def entrypoint(ctx: JobContext):
-    logger.info("=" * 50)
-    logger.info(f"[Agent] New SIP call! Room: {ctx.room.name}")
-    logger.info(f"[Agent] CLINIC_NAME: {CLINIC_NAME}")
-    logger.info(f"[Agent] REALTIME_VOICE: {REALTIME_VOICE}")
-    logger.info("=" * 50)
+        return {
+            "ok": False,
+            "error": "patient_not_resolved",
+            "details": "Need at least caller phone or full patient data",
+        }
 
-    caller_phone = get_caller_phone_from_room_name(ctx.room.name)
-    logger.info(f"[Agent] Caller phone (from room name): {caller_phone}")
+    async def free_terms(self, *, doctor_id: str, date_from: str) -> dict[str, Any]:
+        return await self._post_form({
+            "action": "WolneTerminy",
+            "lekarz_id": doctor_id,
+            "data_od": date_from,
+        })
 
-    agent = MedicalAssistantSIP(caller_phone=caller_phone)
+    async def appointment_book(
+        self,
+        *,
+        doctor_id: str,
+        start_dt: str,
+        end_dt: str,
+        patient_id: str,
+        rodzaj: str = "wizyta",
+    ) -> dict[str, Any]:
+        return await self._post_form({
+            "action": "TerminZapisz",
+            "lekarz_id": doctor_id,
+            "start": start_dt,
+            "end": end_dt,
+            "pcj_id": patient_id,
+            "rodzaj": rodzaj,
+        })
 
-    # Mechanika komunikacyjna zostawiona jak w działającym pliku
-    session = AgentSession(
-        llm=openai.realtime.RealtimeModel(voice=REALTIME_VOICE),
-        vad=silero.VAD.load(),
-    )
+    async def appointment_cancel(self, *, pw_id: str) -> dict[str, Any]:
+        return await self._post_form({
+            "action": "AppointmentCancel",
+            "pw_id": pw_id,
+        })
 
-    await session.start(
-        agent=agent,
-        room=ctx.room,
-    )
+    async def patient_visits(
+        self,
+        *,
+        patient_id: Optional[str] = None,
+        phone: Optional[str] = None,
+        doctor_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        # Contract inferred from front_ajax action map. Backend may ignore unknown fields.
+        payload: dict[str, Any] = {"action": "PatientVisits"}
+        if patient_id:
+            payload["pcj_id"] = patient_id
+        if phone:
+            normalized_phone = self.normalize_phone(phone)
+            payload["telefon"] = normalized_phone
+            payload["kontakt"] = normalized_phone
+        if doctor_id:
+            payload["doctor_id"] = doctor_id
+            payload["lekarz_id"] = doctor_id
+        payload["future_only"] = 1
+        payload["date_from"] = self._today_str()
+        return await self._post_json(payload)
 
-    await ctx.connect()
+    async def appointment_get(
+        self,
+        *,
+        patient_id: Optional[str] = None,
+        phone: Optional[str] = None,
+        doctor_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        # Contract inferred from front_ajax action map.
+        payload: dict[str, Any] = {"action": "AppointmentGet"}
+        if patient_id:
+            payload["pcj_id"] = patient_id
+        if phone:
+            normalized_phone = self.normalize_phone(phone)
+            payload["telefon"] = normalized_phone
+            payload["kontakt"] = normalized_phone
+        if doctor_id:
+            payload["doctor_id"] = doctor_id
+            payload["lekarz_id"] = doctor_id
+        payload["future_only"] = 1
+        payload["date_from"] = self._today_str()
+        return await self._post_json(payload)
 
-    logger.info("[Agent] Session started, generating greeting...")
+    async def appointment_lookup(
+        self,
+        *,
+        patient_id: Optional[str] = None,
+        phone: Optional[str] = None,
+        doctor_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        first = await self.patient_visits(patient_id=patient_id, phone=phone, doctor_id=doctor_id)
+        if first.get("ok") and first.get("data"):
+            return first
+        second = await self.appointment_get(patient_id=patient_id, phone=phone, doctor_id=doctor_id)
+        return second
 
-    await session.generate_reply(
-        instructions=(
-            "Przywitaj sie DOKLADNIE tymi slowami: "
-            "Dzien dobry, tu medyczny asystent glosowy. W czym moge pomoc?"
-        )
-    )
+    async def appointment_reschedule(
+        self,
+        *,
+        pw_id: str,
+        new_start: str,
+        new_end: str,
+        doctor_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        # Contract inferred from front_ajax action map.
+        payload: dict[str, Any] = {
+            "action": "AppointmentReschedule",
+            "pw_id": pw_id,
+            "new_start": new_start,
+            "new_end": new_end,
+        }
+        if doctor_id:
+            payload["doctor_id"] = doctor_id
+            payload["lekarz_id"] = doctor_id
+        return await self._post_json(payload)
 
-    logger.info("[Agent] Greeting generated.")
+    @staticmethod
+    def compact_patient(data: Any) -> dict[str, Any]:
+        if isinstance(data, list):
+            row = data[0] if data else {}
+        elif isinstance(data, dict):
+            row = data
+        else:
+            row = {}
+        return {
+            "pcj_id": str(row.get("pcj_id", "")),
+            "first_name": row.get("pcj_imie") or row.get("imie") or "",
+            "last_name": row.get("pcj_nazwisko") or row.get("nazwisko") or "",
+            "phone": row.get("telefon") or row.get("pcj_kontakt") or row.get("kontakt") or "",
+            "email": row.get("pcj_email") or row.get("email") or "",
+        }
 
+    @staticmethod
+    def compact_slots(data: Any, *, date_to: str = "", time_of_day: str = "") -> list[dict[str, Any]]:
+        rows = data if isinstance(data, list) else []
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            slot_date = str(row.get("data", ""))
+            godz_od = str(row.get("godz_od", ""))
+            godz_do = str(row.get("godz_do", ""))
+            if date_to and slot_date and slot_date > date_to:
+                continue
+            if time_of_day:
+                hh = int(godz_od[:2]) if godz_od and godz_od[:2].isdigit() else -1
+                if time_of_day == "rano" and not (0 <= hh < 12):
+                    continue
+                if time_of_day == "popoludnie" and not (12 <= hh < 17):
+                    continue
+                if time_of_day == "wieczor" and not (17 <= hh <= 21):
+                    continue
+            if slot_date and godz_od and godz_do:
+                out.append({
+                    "slot_id": f"{slot_date}T{godz_od}",
+                    "date": slot_date,
+                    "start_time": godz_od,
+                    "end_time": godz_do,
+                    "start": f"{slot_date} {godz_od}:00",
+                    "end": f"{slot_date} {godz_do}:00",
+                    "day_name": row.get("dzien", ""),
+                    "duration": row.get("czas", ""),
+                })
+        return out
 
-if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="lka",
-        )
-    )
+    @staticmethod
+    def choose_slot(
+        slots: list[dict[str, Any]],
+        *,
+        slot_id: str = "",
+        appointment_date: str = "",
+        appointment_time: str = "",
+    ) -> Optional[dict[str, Any]]:
+        if slot_id:
+            for slot in slots:
+                if slot.get("slot_id") == slot_id:
+                    return slot
+        if appointment_date and appointment_time:
+            for slot in slots:
+                if slot.get("date") == appointment_date and slot.get("start_time") == appointment_time:
+                    return slot
+        if appointment_date:
+            for slot in slots:
+                if slot.get("date") == appointment_date:
+                    return slot
+        return slots[0] if slots else None
+
+    @staticmethod
+    def choose_visit(
+        visits_data: Any,
+        *,
+        pw_id: str = "",
+        appointment_date: str = "",
+    ) -> Optional[dict[str, Any]]:
+        rows = visits_data if isinstance(visits_data, list) else []
+        if isinstance(visits_data, dict):
+            # some APIs wrap list under data/items/visits
+            for key in ("items", "visits", "appointments", "data"):
+                if isinstance(visits_data.get(key), list):
+                    rows = visits_data[key]
+                    break
+        if pw_id:
+            for row in rows:
+                if str(row.get("pw_id", "")) == str(pw_id):
+                    return row
+        if appointment_date:
+            for row in rows:
+                start = str(row.get("pw_start") or row.get("start") or row.get("date") or "")
+                if start.startswith(appointment_date):
+                    return row
+        return rows[0] if rows else None
