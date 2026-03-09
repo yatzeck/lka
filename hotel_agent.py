@@ -51,6 +51,80 @@ def _safe_dump(value: Any, limit: int = 2500) -> str:
     return text
 
 
+def _phone_variants(phone: Optional[str]) -> list[str]:
+    if not phone:
+        return []
+
+    raw = str(phone).strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+
+    variants: list[str] = []
+
+    def add(v: str) -> None:
+        v = (v or "").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    # oryginał
+    add(raw)
+
+    # same cyfry
+    add(digits)
+
+    # +48XXXXXXXXX
+    if len(digits) == 9:
+        add("+48" + digits)
+        add("48" + digits)
+
+    # 48XXXXXXXXX -> lokalny 9-cyfrowy
+    if len(digits) == 11 and digits.startswith("48"):
+        local9 = digits[2:]
+        add(local9)
+        add("+48" + local9)
+        add("48" + local9)
+
+    # dodatkowo bez plusa dla formatu +48XXXXXXXXX
+    if raw.startswith("+") and digits:
+        add(digits)
+
+    return variants
+
+
+async def _recognize_patient_by_caller_phone(
+    client: FrontAjaxClient,
+    caller_phone: Optional[str],
+) -> dict[str, Any]:
+    if not caller_phone:
+        logger.info("[Agent] No caller phone extracted from room name")
+        return {}
+
+    variants = _phone_variants(caller_phone)
+    logger.info("[Agent] Caller phone variants=%s", _safe_dump(variants))
+
+    for candidate in variants:
+        logger.info("[Agent] Trying patient_get by caller phone variant=%s", candidate)
+        resolved = await client.patient_get(phone=candidate)
+        logger.info(
+            "[Agent] patient_get raw for variant %s => %s",
+            candidate,
+            _safe_dump(resolved),
+        )
+
+        if resolved.get("ok") and resolved.get("data"):
+            compact = client.compact_patient(resolved.get("data"))
+            logger.info(
+                "[Agent] compact recognized_patient for variant %s => %s",
+                candidate,
+                _safe_dump(compact),
+            )
+            if compact.get("pcj_id"):
+                logger.info("[Agent] Patient recognized by caller phone variant=%s", candidate)
+                return compact
+
+    logger.info("[Agent] Patient not recognized by any caller phone variant")
+    return {}
+
+
 class KowalskiDemoAgent(Agent):
     def __init__(
         self,
@@ -121,7 +195,10 @@ Specjalizacja: ortopedia
 3. Dopiero potem odwolaj lub przenies.
 
 # Powitanie
-Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
+- Jesli pacjent jest juz rozpoznany po numerze telefonu, przywitaj go naturalnie i wspomnij:
+  "Witam, widze, ze jestes juz u nas."
+- Jesli pacjent nie jest rozpoznany, przywitaj sie standardowo.
+- Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
 """,
         )
 
@@ -403,17 +480,10 @@ async def entrypoint(ctx: JobContext):
     client = FrontAjaxClient()
     logger.info("[Agent] FrontAjaxClient enabled=%s", client.enabled)
 
-    recognized_patient: dict[str, Any] = {}
-    if caller_phone:
-        logger.info("[Agent] Trying patient_get by caller phone=%s", caller_phone)
-        resolved = await client.patient_get(phone=caller_phone)
-        logger.info("[Agent] patient_get raw=%s", _safe_dump(resolved))
-
-        if resolved.get("ok") and resolved.get("data"):
-            recognized_patient = client.compact_patient(resolved.get("data"))
-            logger.info("[Agent] Recognized patient compact=%s", _safe_dump(recognized_patient))
-        else:
-            logger.info("[Agent] Patient not recognized by caller phone")
+    recognized_patient: dict[str, Any] = await _recognize_patient_by_caller_phone(
+        client=client,
+        caller_phone=caller_phone,
+    )
 
     agent = KowalskiDemoAgent(
         caller_phone=caller_phone,
@@ -436,9 +506,18 @@ async def entrypoint(ctx: JobContext):
 
     logger.info("[Agent] Session started, generating greeting...")
 
-    await session.generate_reply(
-        instructions="Przywitaj sie dokladnie tymi slowami: Dzien dobry, tu medyczny asystent glosowy. W czym moge pomoc?"
-    )
+    if recognized_patient.get("pcj_id"):
+        greeting_text = (
+            "Przywitaj sie dokladnie tymi slowami: "
+            "Dzien dobry, witam, widze, ze jestes juz u nas. W czym moge pomoc?"
+        )
+    else:
+        greeting_text = (
+            "Przywitaj sie dokladnie tymi slowami: "
+            "Dzien dobry, tu medyczny asystent glosowy. W czym moge pomoc?"
+        )
+
+    await session.generate_reply(instructions=greeting_text)
 
     logger.info("[Agent] Greeting generated.")
 
