@@ -119,11 +119,15 @@ class FrontAjaxClient:
         email: str = "",
         pesel: str = "",
     ) -> dict[str, Any]:
-        payload = {"action": "PatientGet"}
+        payload = {
+            "action": "PatientGet",
+            "gdzie": "bot",
+        }
+    
         normalized_phone = self.normalize_phone(phone)
         if normalized_phone:
             payload["telefon"] = normalized_phone
-            payload["kontakt"] = normalized_phone
+    
         if first_name:
             payload["imie"] = first_name
         if last_name:
@@ -132,6 +136,7 @@ class FrontAjaxClient:
             payload["email"] = email
         if pesel:
             payload["pesel"] = pesel
+    
         return await self._post_json(payload)
 
     async def patient_add(
