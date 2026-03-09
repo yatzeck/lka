@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY hotel_agent.py .
+COPY wp_front_ajax_client.py .
 
 RUN python hotel_agent.py download-files
 
