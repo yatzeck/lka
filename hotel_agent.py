@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import logging
@@ -30,7 +31,7 @@ AGENT_NAME = os.environ.get("AGENT_NAME", "lka")
 FRONT_AJAX_URL = os.environ.get("FRONT_AJAX_URL", "")
 FRONT_AJAX_API_KEY_SET = bool(os.environ.get("FRONT_AJAX_API_KEY") or os.environ.get("SMS_API_KEY"))
 
-print("=== LKA KOWALSKI DEMO BUILD v1 ===")
+print("=== LKA KOWALSKI DEMO BUILD v1 LOGS ===")
 
 
 def get_caller_phone_from_room_name(room_name: str) -> Optional[str]:
@@ -38,6 +39,16 @@ def get_caller_phone_from_room_name(room_name: str) -> Optional[str]:
         return None
     match = re.search(r"\+?\d{6,}", room_name)
     return match.group(0) if match else None
+
+
+def _safe_dump(value: Any, limit: int = 2500) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = repr(value)
+    if len(text) > limit:
+        return text[:limit] + "...<cut>"
+    return text
 
 
 class KowalskiDemoAgent(Agent):
@@ -59,6 +70,9 @@ class KowalskiDemoAgent(Agent):
                 f"{self.recognized_patient.get('first_name', '')} {self.recognized_patient.get('last_name', '')}, "
                 f"pcj_id={self.recognized_patient.get('pcj_id', '')}, telefon={self.recognized_patient.get('phone', '')}."
             )
+
+        logger.info("[Agent] INIT caller_phone=%s", caller_phone)
+        logger.info("[Agent] INIT recognized_patient=%s", _safe_dump(self.recognized_patient))
 
         super().__init__(
             instructions=f"""
@@ -126,20 +140,29 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             data_do: Opcjonalna data koncowa w formacie YYYY-MM-DD.
             pora_dnia: Opcjonalnie rano, popoludnie albo wieczor.
         """
-        logger.info("[Tool] sprawdz_terminy %s %s %s", data_od, data_do, pora_dnia)
+        logger.info("[Tool] sprawdz_terminy START data_od=%s data_do=%s pora_dnia=%s", data_od, data_do, pora_dnia)
         if not DOCTOR_ID:
+            logger.error("[Tool] sprawdz_terminy ERROR DEMO_DOCTOR_ID missing")
             return {"ok": False, "error": "DEMO_DOCTOR_ID missing"}
+
         raw = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=data_od)
+        logger.info("[Tool] sprawdz_terminy raw=%s", _safe_dump(raw))
+
         if not raw.get("ok"):
+            logger.error("[Tool] sprawdz_terminy ERROR raw not ok")
             return raw
+
         slots = self.client.compact_slots(raw.get("data"), date_to=data_do, time_of_day=pora_dnia)
         self.last_presented_slots = slots[:10]
-        return {
+
+        result = {
             "ok": True,
             "doctor_id": DOCTOR_ID,
             "slots": slots[:3],
             "slots_total": len(slots),
         }
+        logger.info("[Tool] sprawdz_terminy normalized=%s", _safe_dump(result))
+        return result
 
     @function_tool()
     async def umow_termin(
@@ -160,9 +183,21 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             nazwisko: Nazwisko pacjenta. Mozna pominac, jesli pacjent zostal rozpoznany po numerze.
             telefon: Numer telefonu pacjenta. Opcjonalny, domyslnie numer z polaczenia.
         """
-        logger.info("[Tool] umow_termin %s %s", data_wizyty, godzina_od)
+        logger.info(
+            "[Tool] umow_termin START data_wizyty=%s godzina_od=%s imie=%s nazwisko=%s telefon=%s",
+            data_wizyty,
+            godzina_od,
+            imie,
+            nazwisko,
+            telefon,
+        )
+
         phone_to_use = telefon or self.caller_phone or self.recognized_patient.get("phone", "")
+        logger.info("[Tool] umow_termin phone_to_use=%s", phone_to_use)
+        logger.info("[Tool] umow_termin recognized_patient BEFORE=%s", _safe_dump(self.recognized_patient))
+
         patient = self.recognized_patient if self.recognized_patient.get("pcj_id") else None
+        logger.info("[Tool] umow_termin patient from cache=%s", _safe_dump(patient))
 
         if not patient:
             resolved = await self.client.patient_resolve_or_create(
@@ -170,24 +205,41 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
                 first_name=imie,
                 last_name=nazwisko,
             )
+            logger.info("[Tool] umow_termin patient_resolve_or_create raw=%s", _safe_dump(resolved))
+
             if not resolved.get("ok"):
+                logger.error("[Tool] umow_termin ERROR patient_not_resolved")
                 return {
                     "ok": False,
                     "error": "patient_not_resolved",
                     "details": resolved,
                 }
+
             patient = self.client.compact_patient(resolved.get("data"))
             self.recognized_patient = patient
+            logger.info("[Tool] umow_termin compact patient=%s", _safe_dump(patient))
+            logger.info("[Tool] umow_termin recognized_patient AFTER=%s", _safe_dump(self.recognized_patient))
 
         slots_source = self.last_presented_slots
+        logger.info("[Tool] umow_termin last_presented_slots=%s", _safe_dump(slots_source))
+
         if not slots_source:
+            logger.info("[Tool] umow_termin no cached slots, fetching again")
             raw_slots = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=data_wizyty)
+            logger.info("[Tool] umow_termin raw_slots=%s", _safe_dump(raw_slots))
+
             if not raw_slots.get("ok"):
+                logger.error("[Tool] umow_termin ERROR raw_slots not ok")
                 return raw_slots
+
             slots_source = self.client.compact_slots(raw_slots.get("data"), date_to=data_wizyty)
+            logger.info("[Tool] umow_termin normalized slots_source=%s", _safe_dump(slots_source))
 
         slot = self.client.choose_slot(slots_source, appointment_date=data_wizyty, appointment_time=godzina_od)
+        logger.info("[Tool] umow_termin chosen slot=%s", _safe_dump(slot))
+
         if not slot:
+            logger.error("[Tool] umow_termin ERROR slot_not_found")
             return {"ok": False, "error": "slot_not_found"}
 
         booked = await self.client.appointment_book(
@@ -196,12 +248,16 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             end_dt=slot["end"],
             patient_id=patient.get("pcj_id", ""),
         )
-        return {
+        logger.info("[Tool] umow_termin appointment_book raw=%s", _safe_dump(booked))
+
+        result = {
             "ok": booked.get("ok", False),
             "booking_result": booked,
             "patient": patient,
             "slot": slot,
         }
+        logger.info("[Tool] umow_termin result=%s", _safe_dump(result))
+        return result
 
     @function_tool()
     async def odwolaj_termin(
@@ -216,24 +272,40 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             data_wizyty: Opcjonalna data wizyty do anulowania w formacie YYYY-MM-DD.
             pw_id: Opcjonalny identyfikator wizyty, jesli jest juz znany.
         """
-        logger.info("[Tool] odwolaj_termin %s %s", data_wizyty, pw_id)
+        logger.info("[Tool] odwolaj_termin START data_wizyty=%s pw_id=%s", data_wizyty, pw_id)
+
         patient_id = self.recognized_patient.get("pcj_id", "")
+        logger.info("[Tool] odwolaj_termin recognized_patient=%s", _safe_dump(self.recognized_patient))
+        logger.info("[Tool] odwolaj_termin patient_id=%s caller_phone=%s", patient_id, self.caller_phone)
+
         lookup = await self.client.appointment_lookup(
             patient_id=patient_id or None,
             phone=self.caller_phone,
             doctor_id=DOCTOR_ID,
         )
+        logger.info("[Tool] odwolaj_termin appointment_lookup raw=%s", _safe_dump(lookup))
+
         if not lookup.get("ok"):
+            logger.error("[Tool] odwolaj_termin ERROR lookup not ok")
             return lookup
+
         visit = self.client.choose_visit(lookup.get("data"), pw_id=pw_id, appointment_date=data_wizyty)
+        logger.info("[Tool] odwolaj_termin chosen visit=%s", _safe_dump(visit))
+
         if not visit:
+            logger.error("[Tool] odwolaj_termin ERROR appointment_not_found")
             return {"ok": False, "error": "appointment_not_found", "lookup": lookup}
+
         cancel = await self.client.appointment_cancel(pw_id=str(visit.get("pw_id", "")))
-        return {
+        logger.info("[Tool] odwolaj_termin appointment_cancel raw=%s", _safe_dump(cancel))
+
+        result = {
             "ok": cancel.get("ok", False),
             "cancel_result": cancel,
             "visit": visit,
         }
+        logger.info("[Tool] odwolaj_termin result=%s", _safe_dump(result))
+        return result
 
     @function_tool()
     async def przenies_termin(
@@ -252,25 +324,51 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             nowa_godzina_od: Nowa godzina rozpoczecia w formacie HH:MM.
             pw_id: Opcjonalny identyfikator wizyty.
         """
-        logger.info("[Tool] przenies_termin %s -> %s %s", stara_data_wizyty, nowa_data_wizyty, nowa_godzina_od)
+        logger.info(
+            "[Tool] przenies_termin START stara_data_wizyty=%s nowa_data_wizyty=%s nowa_godzina_od=%s pw_id=%s",
+            stara_data_wizyty,
+            nowa_data_wizyty,
+            nowa_godzina_od,
+            pw_id,
+        )
+
         patient_id = self.recognized_patient.get("pcj_id", "")
+        logger.info("[Tool] przenies_termin recognized_patient=%s", _safe_dump(self.recognized_patient))
+        logger.info("[Tool] przenies_termin patient_id=%s caller_phone=%s", patient_id, self.caller_phone)
+
         lookup = await self.client.appointment_lookup(
             patient_id=patient_id or None,
             phone=self.caller_phone,
             doctor_id=DOCTOR_ID,
         )
+        logger.info("[Tool] przenies_termin appointment_lookup raw=%s", _safe_dump(lookup))
+
         if not lookup.get("ok"):
+            logger.error("[Tool] przenies_termin ERROR lookup not ok")
             return lookup
+
         visit = self.client.choose_visit(lookup.get("data"), pw_id=pw_id, appointment_date=stara_data_wizyty)
+        logger.info("[Tool] przenies_termin chosen old visit=%s", _safe_dump(visit))
+
         if not visit:
+            logger.error("[Tool] przenies_termin ERROR appointment_not_found")
             return {"ok": False, "error": "appointment_not_found", "lookup": lookup}
 
         raw_slots = await self.client.free_terms(doctor_id=DOCTOR_ID, date_from=nowa_data_wizyty)
+        logger.info("[Tool] przenies_termin raw_slots=%s", _safe_dump(raw_slots))
+
         if not raw_slots.get("ok"):
+            logger.error("[Tool] przenies_termin ERROR raw_slots not ok")
             return raw_slots
+
         slots = self.client.compact_slots(raw_slots.get("data"), date_to=nowa_data_wizyty)
+        logger.info("[Tool] przenies_termin normalized slots=%s", _safe_dump(slots))
+
         slot = self.client.choose_slot(slots, appointment_date=nowa_data_wizyty, appointment_time=nowa_godzina_od)
+        logger.info("[Tool] przenies_termin chosen new slot=%s", _safe_dump(slot))
+
         if not slot:
+            logger.error("[Tool] przenies_termin ERROR new_slot_not_found")
             return {"ok": False, "error": "new_slot_not_found", "slots": slots[:5]}
 
         moved = await self.client.appointment_reschedule(
@@ -279,12 +377,16 @@ Na poczatku przywitaj sie krotko i zapytaj, w czym mozesz pomoc.
             new_end=slot["end"],
             doctor_id=DOCTOR_ID,
         )
-        return {
+        logger.info("[Tool] przenies_termin appointment_reschedule raw=%s", _safe_dump(moved))
+
+        result = {
             "ok": moved.get("ok", False),
             "reschedule_result": moved,
             "old_visit": visit,
             "new_slot": slot,
         }
+        logger.info("[Tool] przenies_termin result=%s", _safe_dump(result))
+        return result
 
 
 async def entrypoint(ctx: JobContext):
@@ -299,12 +401,17 @@ async def entrypoint(ctx: JobContext):
     logger.info("[Agent] Caller phone (from room name): %s", caller_phone)
 
     client = FrontAjaxClient()
+    logger.info("[Agent] FrontAjaxClient enabled=%s", client.enabled)
+
     recognized_patient: dict[str, Any] = {}
     if caller_phone:
+        logger.info("[Agent] Trying patient_get by caller phone=%s", caller_phone)
         resolved = await client.patient_get(phone=caller_phone)
+        logger.info("[Agent] patient_get raw=%s", _safe_dump(resolved))
+
         if resolved.get("ok") and resolved.get("data"):
             recognized_patient = client.compact_patient(resolved.get("data"))
-            logger.info("[Agent] Recognized patient: %s", recognized_patient)
+            logger.info("[Agent] Recognized patient compact=%s", _safe_dump(recognized_patient))
         else:
             logger.info("[Agent] Patient not recognized by caller phone")
 
@@ -332,6 +439,8 @@ async def entrypoint(ctx: JobContext):
     await session.generate_reply(
         instructions="Przywitaj sie dokladnie tymi slowami: Dzien dobry, tu medyczny asystent glosowy. W czym moge pomoc?"
     )
+
+    logger.info("[Agent] Greeting generated.")
 
 
 if __name__ == "__main__":
